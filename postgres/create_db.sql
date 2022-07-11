@@ -1,4 +1,4 @@
-drop table if exists items,order_info, payments,deliveries, order_delivery;
+drop table if exists items,order_info, payments,deliveries, order_delivery, invalid_data;
 
 
 
@@ -67,4 +67,11 @@ create table order_delivery
 (
     order_uid   varchar(50) references order_info (order_uid),
     delivery_id int references deliveries (id)
+);
+
+create table invalid_data
+(
+    id        serial primary key,
+    data      varchar,
+    timestamp timestamp default now()
 );

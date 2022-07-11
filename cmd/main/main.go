@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v4"
+	"github.com/joho/godotenv"
+	"github.com/nats-io/stan.go"
+	"github.com/patrickmn/go-cache"
+	"net/http"
 	"os"
 	"time"
 )
@@ -65,99 +70,93 @@ type Items struct {
 }
 
 func main() {
-	urlExample := "postgres://lifest:12345@localhost:5432/wbl0"
-	conn, err := pgx.Connect(context.Background(), urlExample)
+
+	fmt.Println("Инициализация приложения ...")
+	fmt.Print("Инициализация переменных окружения ... ")
+	err := godotenv.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to connect to database: %v\n", err)
+		fmt.Println("Не найден .env файл")
 		os.Exit(1)
 	}
-	json_value := `{
-		"order_uid": "b563feb7b2b84b6test",
-			"track_number": "WBILMTESTTRACK",
-			"entry": "WBIL",
-			"delivery": {
-			"name": "Test Testov",
-				"phone": "+9720000000",
-				"zip": "2639809",
-				"city": "Kiryat Mozkin",
-				"address": "Ploshad Mira 15",
-				"region": "Kraiot",
-				"email": "test@gmail.com"
-		},
-		"payment": {
-			"transaction": "b563feb7b2b84b6test",
-				"request_id": "",
-				"currency": "USD",
-				"provider": "wbpay",
-				"amount": 1817,
-				"payment_dt": 1637907727,
-				"bank": "alpha",
-				"delivery_cost": 1500,
-				"goods_total": 317,
-				"custom_fee": 0
-		},
-		"items": [
-	{
-	"chrt_id": 9934930,
-	"track_number": "WBILMTESTTRACK",
-	"price": 453,
-	"rid": "ab4219087a764ae0btest",
-	"name": "Mascaras",
-	"sale": 30,
-	"size": "0",
-	"total_price": 317,
-	"nm_id": 2389212,
-	"brand": "Vivienne Sabo",
-	"status": 202
-	},
-{
-	"chrt_id": 441293,
-	"track_number": "WBILMTESTTRACK",
-	"price": 453,
-	"rid": "ab4219087a764ae0btest",
-	"name": "Mascaras",
-	"sale": 30,
-	"size": "0",
-	"total_price": 317,
-	"nm_id": 6669212,
-	"brand": "Boar Lui",
-	"status": 202
+	fmt.Print("COMPLETE\n")
+	fmt.Printf("Подключение к БД: %v ... ", os.Getenv("DB_NAME"))
+	// формирование полного адреса для подключения к БД
+	urlExample := fmt.Sprintf("%v://%v:%v@%v:%v/%v", os.Getenv("DRIVER"), os.Getenv("USERNAME"),
+		os.Getenv("PASSWORD"), os.Getenv("HOST"), os.Getenv("PORT"), os.Getenv("DB_NAME"))
+	conn, err := pgx.Connect(context.Background(), urlExample)
+	if err != nil {
+		fmt.Printf("Не удалось подключиться к БД: %v\n", err)
+		os.Exit(1)
 	}
-	],
-	"locale": "en",
-	"internal_signature": "",
-	"customer_id": "test",
-	"delivery_service": "meest",
-	"shardkey": "9",
-	"sm_id": 99,
-	"date_created": "2021-11-26T06:22:19Z",
-	"oof_shard": "1"
-	}`
-
 	defer conn.Close(context.Background())
+	fmt.Print("COMPLETE\n")
+	// Получение всех order_uid из БД создания кэша
+	order_uid := GetOrderUid(conn)
+	Cache := cache.New(-1, -1)
+	for i := range order_uid {
+		data, _ := GetDataByUid(conn, order_uid[i])
+		Cache.Set(order_uid[i], data, cache.NoExpiration)
+	}
+	fmt.Printf("Восстановление данных из БД в кэш ... записей найдено (%v)\n", len(Cache.Items()))
+
+	// Подключение к кластеру nats-streaming-service
+	sc, _ := stan.Connect("test-cluster", "simple-pub")
+	defer sc.Close()
 	var order OrderInfo
-	json.Unmarshal([]byte(json_value), &order)
-	//InsertData(conn, order)
-	res, err := GetDataByUid(conn, "b563feb7b2b84b6test")
-	fmt.Println(res)
-	//GetOrders(conn, "b563feb7b2b84b6test")
-	//result := getItemsFromDb(conn, "WBILMTESTTRACK")
-	//fmt.Println(result)
+	// подписка на канал для дальнейшей обработки полученных данных
+	sc.Subscribe("service", func(m *stan.Msg) {
+		err := json.Unmarshal(m.Data, &order)
+		if err != nil {
+			fmt.Println("Invalid json")
+			InsertInvalidData(conn, string(m.Data))
+		} else {
+			fmt.Printf("Got: Valid json %v... complete\n", string(m.Data))
+			fmt.Println(order.OrderUid)
+			Cache.Set(order.OrderUid, string(m.Data), cache.NoExpiration)
+			InsertData(conn, order)
+		}
+	})
+	// http сервер который позволяет получить информацию о заказе по order_uid
+	r := gin.Default()
+	r.LoadHTMLGlob("templates/*.html")
+	r.GET("/", func(c *gin.Context) {
+		c.HTML(http.StatusOK, "index.html", gin.H{
+			"content": "This is an index page...",
+		})
+	})
+	r.POST("/result", func(c *gin.Context) {
+		result, _ := Cache.Get(c.PostForm("order_uid"))
+		c.PureJSON(http.StatusOK, result)
+	})
+	r.Run(":8080")
+
 }
 
 // InsertData Парсинг json и вставка данных в бд
 func InsertData(conn *pgx.Conn, order OrderInfo) {
 	err := InsertDataPayment(conn, order)
-	fmt.Println(err)
+	if err != nil {
+		fmt.Println(err)
+	}
 	uid, err := InsertDataOrder(conn, order)
-	fmt.Println(uid, err)
+	if err != nil {
+		fmt.Println(err)
+	}
 	id, err := InsertDataDelivery(conn, order)
-	fmt.Println(id, err)
+	if err != nil {
+		fmt.Println(err)
+	}
 	err = InsertOrderDelivery(conn, uid, id)
-	fmt.Println(err)
+	if err != nil {
+		fmt.Println(err)
+	}
 	err = InsertDataItems(conn, order)
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
+// Вставка данных о заказе в таблицу order_info
 func InsertDataOrder(conn *pgx.Conn, order OrderInfo) (order_uid string, err error) {
 	query := `
 		insert into order_info
@@ -186,6 +185,7 @@ func InsertDataOrder(conn *pgx.Conn, order OrderInfo) (order_uid string, err err
 	return order_uid, nil
 }
 
+// Вставка данных о доставке в таблицу delivery в БД
 func InsertDataDelivery(conn *pgx.Conn, order OrderInfo) (id int, err error) {
 	query := `
 		insert into deliveries
@@ -208,9 +208,10 @@ func InsertDataDelivery(conn *pgx.Conn, order OrderInfo) (id int, err error) {
 			return 0, pgErr
 		}
 	}
-	fmt.Println(id)
 	return id, nil
 }
+
+// Вставка данных о платеже в таблицу payments в БД
 func InsertDataPayment(conn *pgx.Conn, order OrderInfo) (err error) {
 	query := `
 		insert into payments
@@ -238,6 +239,8 @@ func InsertDataPayment(conn *pgx.Conn, order OrderInfo) (err error) {
 	}
 	return nil
 }
+
+// Вставка данных в таблицу order_delivery для связи между таблицами order_info и delivery в БД
 func InsertOrderDelivery(conn *pgx.Conn, order_uid string, id int) (err error) {
 	query := `
 		insert into order_delivery
@@ -253,9 +256,10 @@ func InsertOrderDelivery(conn *pgx.Conn, order_uid string, id int) (err error) {
 	}
 	return nil
 }
+
+// Вставка данных о предметах в таблицу Items в БД
 func InsertDataItems(conn *pgx.Conn, order OrderInfo) (err error) {
 	for i := 0; i < len(order.Items); i++ {
-		fmt.Println(order.Items[i])
 		query := `
 			insert into items
 				(chrt_id,track_number,price,rid,name,sale,size,total_price,nm_id,brand,status)
@@ -284,6 +288,8 @@ func InsertDataItems(conn *pgx.Conn, order OrderInfo) (err error) {
 
 	return nil
 }
+
+// Получение данных по order_uid из БД
 func GetDataByUid(conn *pgx.Conn, order_uid string) (string, error) {
 	var order OrderInfo
 	query := `
@@ -328,61 +334,28 @@ func GetDataByUid(conn *pgx.Conn, order_uid string) (string, error) {
 	return string(res), nil
 }
 
-//
-//func GetDataOrders(conn *pgx.Conn, order_uid string) {
-//	var o OrderInfo
-//	err := conn.QueryRow(context.Background(), "select to_json(*) from order_info where order_uid=$1", order_uid).Scan(
-//		&o.OrderUid,
-//		&o.TrackNumber,
-//		&o.Entry,
-//		&o.Locale,
-//		&o.InternalSignature,
-//		&o.CustomerId,
-//		&o.DeliveryService,
-//		&o.Shardkey,
-//		&o.SmId,
-//		&o.DateCreated,
-//		&o.OofShard,
-//	)
-//	if err != nil {
-//		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
-//	}
-//	result, err := json.Marshal(o)
-//	fmt.Println(string(result))
-//
-//}
-//
-//func GetItems(conn *pgx.Conn, track_number string) string {
-//
-//	rows, err := conn.Query(context.Background(), "select * from items where track_number=$1", track_number)
-//	if err != nil {
-//		fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
-//	}
-//	var rowSlice []Items
-//
-//	for rows.Next() {
-//		var r Items
-//		err := rows.Scan(&r.ChrtId, &r.TrackNumber, &r.Price, &r.Rid, &r.Name, &r.Sale, &r.Size, &r.TotalPrice, &r.NmId, &r.Brand, &r.Status)
-//		if err != nil {
-//			log.Fatal(err)
-//		}
-//		rowSlice = append(rowSlice, r)
-//	}
-//	if err := rows.Err(); err != nil {
-//		log.Fatal(err)
-//	}
-//	result, err := json.Marshal(rowSlice)
-//	return string(result)
-//}
-//
-//func GetPayments(conn *pgx.Conn, order_uid string) {
-//
-//}
-//
-//func GetDeliveryId(conn *pgx.Conn, order_uid string) int {
-//	return 0
-//}
-//
-//func GetDataDelivery(conn *pgx.Conn, delivery_id int) {
-//
-//}
+// Получение всех order_uid из БД для
+func GetOrderUid(conn *pgx.Conn) (slice_uid []string) {
+
+	query := `
+		select array_agg(order_uid) from order_info		
+`
+	err := conn.QueryRow(context.Background(), query).Scan(&slice_uid)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return slice_uid
+}
+
+// Вставка невалидных данных в БД
+func InsertInvalidData(conn *pgx.Conn, data string) (err error) {
+	query := `insert into invalid_data(data) values ($1)`
+	if err = conn.QueryRow(context.Background(), query, data).Scan(); err != nil {
+		if pgErr, ok := err.(*pgconn.PgError); ok {
+			fmt.Println(pgErr)
+			return pgErr
+		}
+
+	}
+	return nil
+}
