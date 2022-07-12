@@ -107,17 +107,18 @@ func main() {
 	sc.Subscribe("service", func(m *stan.Msg) {
 		err := json.Unmarshal(m.Data, &order)
 		if err != nil {
-			fmt.Println("Invalid json")
+			fmt.Println("Got: Invalid json")
 			InsertInvalidData(conn, string(m.Data))
 		} else {
-			fmt.Printf("Got: Valid json %v... complete\n", string(m.Data))
-			fmt.Println(order.OrderUid)
+			fmt.Println("Got: Valid json")
 			Cache.Set(order.OrderUid, string(m.Data), cache.NoExpiration)
 			InsertData(conn, order)
 		}
 	})
 	// http сервер который позволяет получить информацию о заказе по order_uid
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
+	fmt.Println("Http сервер запущен на http://localhost:8080")
 	r.LoadHTMLGlob("templates/*.html")
 	r.GET("/", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "index.html", gin.H{
@@ -126,7 +127,12 @@ func main() {
 	})
 	r.POST("/result", func(c *gin.Context) {
 		result, _ := Cache.Get(c.PostForm("order_uid"))
-		c.PureJSON(http.StatusOK, result)
+		if result == nil {
+			c.PureJSON(http.StatusOK, "Записей по такому order_uid не найдено")
+		} else {
+			c.PureJSON(http.StatusOK, result)
+		}
+
 	})
 	r.Run(":8080")
 
